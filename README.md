@@ -1,23 +1,39 @@
-# Fechamento combinatório (v, k, t, m)
+# Fechamento combinatório `(v,k,t,m)`
 
-Aplicação desktop em Python/Tkinter, sem dependências externas.
+Aplicação desktop Tkinter sem dependências externas.
 
-## Executar
+## Definição implementada
+
+Para todo resultado `M` com `m` números, o programa procura bilhete `B` com `k` números tal que:
+
+```text
+|B ∩ M| >= t
+```
+
+As restrições são `k <= v`, `m <= v`, `m >= t` e `k >= t`.
+
+A cobertura de um bilhete é calculada corretamente por:
+
+```text
+sum(C(k,i) * C(v-k,m-i) for i in range(t, min(k,m)+1))
+```
+
+O limite inferior exibido é o limite por contagem:
+
+```text
+ceil(C(v,m) / cobertura_por_bilhete)
+```
+
+## Execução
 
 ```bash
 python main.py
 ```
 
-Python 3.9+ é recomendado. Tkinter normalmente já vem incluído no Python para Windows.
+## Motor
 
-## Modelo utilizado
+O motor é uma heurística de **set cover**: cria candidatos de `k` números contendo `t` números de resultados ainda não cobertos e escolhe o candidato que cobre a maior quantidade de resultados pela condição real `|B ∩ M| >= t`.
 
-A aplicação valida `m >= t`, conforme a convenção solicitada. A cobertura é calculada sobre subconjuntos de tamanho `m`: cada subconjunto deve estar contido em pelo menos um bilhete de tamanho `k`. Quando o número de subconjuntos é muito grande, o motor trabalha com amostragem limitada e informa claramente que o resultado é estimado, evitando travar o computador.
+Quando `C(v,m)` cabe no limite seguro, a verificação é exata. Em configurações muito grandes, o programa usa uma amostra limitada e informa `AMOSTRAL`, sem tentar alocar combinações gigantescas e travar o computador.
 
-Os motores disponíveis são:
-
-- **Automático**: escolhe enumeração exata apenas quando ela é segura; caso contrário usa heurística limitada.
-- **Rápido (heurístico)**: busca gulosa/randomizada com limite de memória e tempo.
-- **Exato (pequeno)**: enumera somente instâncias pequenas; recusa automaticamente instâncias perigosas.
-
-A validação de bilhetes colados usa enumeração exata somente dentro do limite seguro e também informa quando a análise é amostral.
+O botão **VALIDAR JOGOS** lê os jogos colados na área de bilhetes, calcula a porcentagem de garantia, lista resultados não cobertos e exibe o selo ouro quando a verificação exata chega a 100%.

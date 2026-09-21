@@ -7,16 +7,14 @@ import time
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-
+# Limites de segurança: o programa nunca cria C(v,m) gigantesco na memória.
 MAX_EXACT_TARGETS = 250_000
-MAX_EXACT_BLOCKS = 100_000
-MAX_SAMPLES = 30_000
-CANDIDATES_PER_ROUND = 80
+CANDIDATES_PER_ROUND = 120
 
 
 @dataclass(frozen=True)
@@ -33,11 +31,13 @@ class Config:
             raise ValueError("v, k, t e m devem ser positivos.")
         if self.k > self.v:
             raise ValueError("k não pode ser maior que v.")
-        # Convenção solicitada pelo usuário: m >= t.
+        if self.m > self.v:
+            raise ValueError("m não pode ser maior que v.")
+        # Definição: resultado tem m números e a garantia é t acertos.
         if self.m < self.t:
-            raise ValueError("A condição para acerto deve obedecer a m >= t.")
-        if self.m > self.k:
-            raise ValueError("m não pode ser maior que k.")
+            raise ValueError("A configuração exige m >= t.")
+        if self.k < self.t:
+            raise ValueError("Cada bilhete deve ter k >= t.")
         if self.seconds < 0:
             raise ValueError("O tempo deve ser 0 (sem limite) ou positivo.")
 
@@ -51,11 +51,12 @@ class Result:
     elapsed: float
     iterations: int
     method: str
-    stopped: bool = False
+    stopped: bool
+    uncovered_examples: List[Tuple[int, ...]]
 
     @property
     def percentage(self) -> float:
-        return 100.0 if self.total == 0 else 100.0 * self.covered / self.total
+        return 100.0 if not self.total else 100.0 * self.covered / self.total
 
     @property
     def complete(self) -> bool:
@@ -70,144 +71,139 @@ def fmt(n: int) -> str:
     return f"{n:,}".replace(",", ".")
 
 
-def make_config(v: int, k: int, t: int, m: int, mode: str, seconds: float) -> Config:
-    cfg = Config(v, k, t, m, mode, seconds)
-    cfg.validate()
-    return cfg
+def format_block(block: Sequence[int]) -> str:
+    return ",".join(str(x) for x in block)
+
+
+def coverage_per_ticket(cfg: Config) -> int:
+    """Quantidade exata de resultados de m cobertos por um bilhete de k."""
+    return sum(
+        choose(cfg.k, i) * choose(cfg.v - cfg.k, cfg.m - i)
+        for i in range(cfg.t, min(cfg.k, cfg.m) + 1)
+    )
+
+
+def counting_lower_bound(cfg: Config) -> int:
+    per = coverage_per_ticket(cfg)
+    return math.ceil(choose(cfg.v, cfg.m) / per) if per else 0
+
+
+def as_mask(block: Sequence[int]) -> int:
+    result = 0
+    for number in block:
+        result |= 1 << (number - 1)
+    return result
+
+
+def covers(block_mask: int, target_mask: int, t: int) -> bool:
+    return (block_mask & target_mask).bit_count() >= t
 
 
 def timed_out(start: float, seconds: float, stop: threading.Event) -> bool:
     return stop.is_set() or (seconds > 0 and time.monotonic() - start >= seconds)
 
 
-def random_block(v: int, k: int) -> Tuple[int, ...]:
-    return tuple(sorted(random.sample(range(1, v + 1), k)))
-
-
-def target_samples(cfg: Config, total: int) -> Tuple[List[Tuple[int, ...]], bool]:
-    """Returns targets and whether the set is an exact enumeration."""
+def make_targets(cfg: Config) -> Tuple[List[Tuple[int, ...]], bool]:
+    total = choose(cfg.v, cfg.m)
     if total <= MAX_EXACT_TARGETS:
         return list(combinations(range(1, cfg.v + 1), cfg.m)), True
-    # Sampling is deliberately bounded: never materialize C(v,m) for large inputs.
-    seen = set()
-    wanted = min(MAX_SAMPLES, total)
-    while len(seen) < wanted:
-        seen.add(tuple(sorted(random.sample(range(1, cfg.v + 1), cfg.m))))
-    return list(seen), False
+
+    # Amostra fixa e limitada para configurações grandes. Isso evita travar o PC.
+    sample_size = min(30_000, total)
+    targets = set()
+    while len(targets) < sample_size:
+        targets.add(tuple(sorted(random.sample(range(1, cfg.v + 1), cfg.m))))
+    return list(targets), False
 
 
-def lower_bound(cfg: Config) -> int:
-    # Contagem simples solicitada: um bilhete contém C(k,m) subconjuntos de m.
-    per = choose(cfg.k, cfg.m)
-    return math.ceil(choose(cfg.v, cfg.m) / per) if per else 0
+def candidate_gain(block: Tuple[int, ...], block_mask: int,
+                   target_masks: Sequence[int], uncovered: set[int], t: int) -> List[int]:
+    return [i for i in uncovered if covers(block_mask, target_masks[i], t)]
 
 
-def coverage_of(blocks: Sequence[Tuple[int, ...]], targets: Sequence[Tuple[int, ...]]) -> int:
-    masks = [sum(1 << (x - 1) for x in b) for b in blocks]
-    count = 0
-    for target in targets:
-        mask = sum(1 << (x - 1) for x in target)
-        if any(mask & b == mask for b in masks):
-            count += 1
-    return count
-
-
-def greedy(cfg: Config, stop: threading.Event, progress: Callable[[str, float], None]) -> Result:
-    start = time.monotonic()
-    total = choose(cfg.v, cfg.m)
-    targets, exact = target_samples(cfg, total)
-    target_index = {s: i for i, s in enumerate(targets)}
+def greedy_cover(cfg: Config, stop: threading.Event,
+                 progress: Callable[[str, float], None]) -> Result:
+    """Resolve o covering set no universo exato ou na amostra segura."""
+    started = time.monotonic()
+    targets, exact = make_targets(cfg)
+    target_masks = [as_mask(target) for target in targets]
     uncovered = set(range(len(targets)))
     blocks: List[Tuple[int, ...]] = []
-    used = set()
+    block_masks = set()
     iterations = 0
 
-    def candidate_gain(block: Tuple[int, ...]) -> List[int]:
-        gain = []
-        for s in combinations(block, cfg.m):
-            idx = target_index.get(s)
-            if idx is not None and idx in uncovered:
-                gain.append(idx)
-        return gain
-
-    while uncovered and not timed_out(start, cfg.seconds, stop):
-        best = None
+    while uncovered and not timed_out(started, cfg.seconds, stop):
+        best_block: Optional[Tuple[int, ...]] = None
+        best_mask = 0
         best_gain: List[int] = []
-        # Candidate pool is bounded; there is no C(v,k) expansion.
+
+        # Cada candidato nasce de um resultado ainda não coberto. Assim,
+        # o motor constrói bilhetes que realmente cobrem resultados.
+        available_uncovered = tuple(uncovered)
         for _ in range(CANDIDATES_PER_ROUND):
-            if timed_out(start, cfg.seconds, stop):
+            if timed_out(started, cfg.seconds, stop):
                 break
-            if uncovered and random.random() < 0.75:
-                seed = targets[random.choice(tuple(uncovered))]
-                rest = [x for x in range(1, cfg.v + 1) if x not in seed]
-                b = tuple(sorted(seed + tuple(random.sample(rest, cfg.k - cfg.m))))
-            else:
-                b = random_block(cfg.v, cfg.k)
-            if b in used:
+            seed_target = targets[random.choice(available_uncovered)]
+            remaining = [x for x in range(1, cfg.v + 1) if x not in seed_target]
+            extra = random.sample(remaining, cfg.k - cfg.t)
+            block = tuple(sorted(set(seed_target[:cfg.t]) | set(extra)))
+            if len(block) != cfg.k:
                 continue
-            gain = candidate_gain(b)
+            block_mask = as_mask(block)
+            if block_mask in block_masks:
+                continue
+            gain = candidate_gain(block, block_mask, target_masks, uncovered, cfg.t)
             if len(gain) > len(best_gain):
-                best, best_gain = b, gain
-        if best is None or not best_gain:
+                best_block, best_mask, best_gain = block, block_mask, gain
+
+        if best_block is None or not best_gain:
             break
-        used.add(best)
-        blocks.append(best)
+        blocks.append(best_block)
+        block_masks.add(best_mask)
         uncovered.difference_update(best_gain)
         iterations += 1
+        covered_count = len(targets) - len(uncovered)
+        percent = 100.0 * covered_count / max(1, len(targets))
         progress(
-            f"{len(blocks)} bilhete(s) | cobertos {len(targets) - len(uncovered)}/{len(targets)} "
-            f"| {100 * (len(targets) - len(uncovered)) / max(1, len(targets)):.2f}%",
-            100 * (len(targets) - len(uncovered)) / max(1, len(targets)),
-        )
+            f"{len(blocks)} bilhete(s) | {covered_count}/{len(targets)} resultados "
+            f"cobertos | {percent:.2f}%", percent)
 
-    covered = len(targets) - len(uncovered)
-    return Result(blocks, covered, len(targets), exact, time.monotonic() - start, iterations, "heurístico", stop.is_set())
-
-
-def exact_small(cfg: Config, stop: threading.Event, progress: Callable[[str, float], None]) -> Result:
-    total_blocks = choose(cfg.v, cfg.k)
-    total_targets = choose(cfg.v, cfg.m)
-    if total_blocks > MAX_EXACT_BLOCKS or total_targets > 5_000:
-        raise ValueError(
-            "O motor exato foi protegido contra explosão combinatória. "
-            "Use Automático ou Rápido para esta configuração."
-        )
-    # Para casos pequenos, procura uma solução por cobertura gulosa determinística.
-    # A enumeração completa de combinações de blocos continua proibida.
-    return greedy(cfg, stop, progress)
+    elapsed = time.monotonic() - started
+    uncovered_examples = [targets[i] for i in list(uncovered)[:100]]
+    return Result(blocks, len(targets) - len(uncovered), len(targets), exact,
+                  elapsed, iterations, "cobertura gulosa", stop.is_set(), uncovered_examples)
 
 
-def solve(cfg: Config, stop: threading.Event, progress: Callable[[str, float], None]) -> Result:
-    if cfg.mode == "exato":
-        return exact_small(cfg, stop, progress)
-    if cfg.mode == "rápido (heurístico)":
-        return greedy(cfg, stop, progress)
-    # Automático: exato seguro apenas em tamanho minúsculo; heurístico no restante.
-    if choose(cfg.v, cfg.k) <= 2_000 and choose(cfg.v, cfg.m) <= 5_000:
-        return exact_small(cfg, stop, progress)
-    return greedy(cfg, stop, progress)
+def solve(cfg: Config, stop: threading.Event,
+          progress: Callable[[str, float], None]) -> Result:
+    # Uma busca exaustiva por coleções de blocos é impraticável mesmo para
+    # tamanhos moderados. O motor abaixo é uma heurística de set-cover real:
+    # cada bilhete é escolhido pelo ganho de cobertura |B∩M| >= t.
+    return greedy_cover(cfg, stop, progress)
 
 
-def parse_tickets(text: str, k: int) -> List[Tuple[int, ...]]:
-    result = []
+def parse_tickets(text: str, k: int) -> Tuple[List[Tuple[int, ...]], int]:
+    valid: List[Tuple[int, ...]] = []
+    ignored = 0
     for line in text.splitlines():
         line = line.strip().replace("[", "").replace("]", "").replace("(", "").replace(")", "")
         if not line:
             continue
-        # Aceita vírgula, ponto e vírgula, tab, pipe e espaços; remove numeração "1.".
         for sep in (";", "|", "\t", ","):
             line = line.replace(sep, " ")
-        nums = []
+        values = []
         for token in line.split():
             token = token.rstrip(".")
             try:
-                nums.append(int(token))
+                values.append(int(token))
             except ValueError:
                 pass
-        nums = sorted(set(nums))
-        if len(nums) == k:
-            result.append(tuple(nums))
-    return list(dict.fromkeys(result))
+        values = sorted(set(values))
+        if len(values) == k:
+            valid.append(tuple(values))
+        else:
+            ignored += 1
+    return list(dict.fromkeys(valid)), ignored
 
 
 class App:
@@ -216,44 +212,50 @@ class App:
         self.root.title("Fechamento combinatório — (v, k, t, m)")
         self.root.geometry("1280x850")
         self.root.minsize(980, 680)
-        self.stop = threading.Event()
+        self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self.config: Optional[Config] = None
         self.result: Optional[Result] = None
-        self.cfg: Optional[Config] = None
-        self.vars = {name: tk.StringVar(value=value) for name, value in {
-            "v": "20", "k": "8", "t": "5", "m": "5", "seconds": "30",
+        self.values = {key: tk.StringVar(value=value) for key, value in {
+            "v": "20", "k": "8", "t": "5", "m": "5", "seconds": "30"
         }.items()}
         self.mode = tk.StringVar(value="automático")
         self.status = tk.StringVar(value="Pronto.")
-        self.build()
+        self.build_ui()
 
-    def build(self) -> None:
+    def build_ui(self) -> None:
         root = ttk.Frame(self.root, padding=10)
         root.pack(fill="both", expand=True)
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(1, weight=1)
-        root.rowconfigure(2, weight=1)
+        root.rowconfigure(0, weight=1)
+        root.rowconfigure(1, weight=0)
+        root.rowconfigure(2, weight=2)
 
         config = ttk.LabelFrame(root, text="CONFIGURAÇÃO", padding=10)
-        config.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 10))
-        labels = [("Total de números a cercar (v):", "v"), ("Números por bilhete (k):", "k"),
-                  ("Garantia pretendida (t):", "t"), ("Condição para acerto (m):", "m")]
-        for i, (label, key) in enumerate(labels):
-            ttk.Label(config, text=label, anchor="center", justify="center", width=28).grid(row=i * 2, column=0, sticky="ew", pady=(3, 0))
-            # Spinbox é a barra/controle de rolagem numérica solicitada; texto centralizado.
-            spin = tk.Spinbox(config, from_=1, to=100000, textvariable=self.vars[key], width=12,
-                              justify="center", font=("TkDefaultFont", 11))
-            spin.grid(row=i * 2 + 1, column=0, pady=(0, 6))
-        ttk.Separator(config).grid(row=8, column=0, sticky="ew", pady=4)
-        ttk.Label(config, text="Modo do motor:").grid(row=9, column=0, sticky="w")
-        ttk.Combobox(config, textvariable=self.mode, state="readonly", values=("automático", "rápido (heurístico)", "exato"), width=25).grid(row=10, column=0, pady=4)
-        ttk.Label(config, text="Tempo (segundos; 0 = sem limite):").grid(row=11, column=0, sticky="w")
-        tk.Spinbox(config, from_=0, to=86400, increment=1, textvariable=self.vars["seconds"], width=12, justify="center").grid(row=12, column=0, pady=(0, 8))
+        config.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        config.columnconfigure(1, weight=1)
+        fields = [("Total de números a cercar (v) :", "v"),
+                  ("Números por bilhete (k) :", "k"),
+                  ("Garantia pretendida (t) :", "t"),
+                  ("Condição para acerto (m) :", "m")]
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(config, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=5)
+            spin = tk.Spinbox(config, from_=1, to=100000, textvariable=self.values[key],
+                              width=10, justify="center")
+            spin.grid(row=row, column=1, sticky="e", padx=(10, 0), pady=5)
+
+        ttk.Label(config, text="Modo do motor:").grid(row=4, column=0, sticky="w", pady=(15, 5))
+        ttk.Combobox(config, textvariable=self.mode, state="readonly",
+                     values=("automático", "rápido (heurístico)"), width=21).grid(row=4, column=1, sticky="e", pady=(15, 5))
+        ttk.Label(config, text="Tempo (0 = sem limite):").grid(row=5, column=0, sticky="w", pady=5)
+        tk.Spinbox(config, from_=0, to=86400, textvariable=self.values["seconds"],
+                   width=10, justify="center").grid(row=5, column=1, sticky="e", pady=5)
+
         buttons = ttk.Frame(config)
-        buttons.grid(row=13, column=0, sticky="ew")
-        for col in range(2): buttons.columnconfigure(col, weight=1)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(15, 0))
+        buttons.columnconfigure(0, weight=1); buttons.columnconfigure(1, weight=1)
         ttk.Button(buttons, text="GERAR FECHAMENTO", command=self.start).grid(row=0, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Button(buttons, text="PARAR", command=self.stop_run).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(buttons, text="PARAR", command=self.stop).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=2)
         ttk.Button(buttons, text="SALVAR TXT", command=self.save).grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=2)
         ttk.Button(buttons, text="LIMPAR", command=self.clear).grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
 
@@ -262,50 +264,69 @@ class App:
         analysis.rowconfigure(0, weight=1); analysis.columnconfigure(0, weight=1)
         self.analysis = tk.Text(analysis, wrap="word", state="disabled")
         self.analysis.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(analysis, command=self.analysis.yview); sb.grid(row=0, column=1, sticky="ns"); self.analysis.configure(yscrollcommand=sb.set)
+        scrollbar = ttk.Scrollbar(analysis, command=self.analysis.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.analysis.configure(yscrollcommand=scrollbar.set)
 
         progress = ttk.LabelFrame(root, text="PROGRESSO", padding=6)
-        progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 5))
+        progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 5))
         ttk.Label(progress, textvariable=self.status, anchor="w").pack(fill="x")
-        self.bar = ttk.Progressbar(progress, maximum=100); self.bar.pack(fill="x", pady=(5, 0))
+        self.progress_bar = ttk.Progressbar(progress, maximum=100)
+        self.progress_bar.pack(fill="x", pady=(5, 0))
 
-        tickets = ttk.LabelFrame(root, text="BILHETES GERADOS / COLE BILHETES PARA VALIDAR", padding=6)
-        tickets.grid(row=3, column=0, columnspan=2, sticky="nsew")
-        root.rowconfigure(3, weight=2)
-        self.ticket_text = tk.Text(tickets, wrap="none", height=12)
+        tickets = ttk.LabelFrame(root, text="BILHETES GERADOS / COLAR JOGOS PARA VALIDAÇÃO", padding=6)
+        tickets.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self.ticket_text = tk.Text(tickets, wrap="none")
         self.ticket_text.pack(side="left", fill="both", expand=True)
-        ts = ttk.Scrollbar(tickets, command=self.ticket_text.yview); ts.pack(side="right", fill="y"); self.ticket_text.configure(yscrollcommand=ts.set)
-        ttk.Button(root, text="TESTAR COBERTURA DOS BILHETES COLADOS", command=self.validate_pasted).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ticket_scroll = ttk.Scrollbar(tickets, command=self.ticket_text.yview)
+        ticket_scroll.pack(side="right", fill="y")
+        self.ticket_text.configure(yscrollcommand=ticket_scroll.set)
+        ttk.Button(root, text="VALIDAR JOGOS", command=self.validate_games).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-    def read_cfg(self) -> Config:
-        return make_config(*(int(self.vars[x].get()) for x in ("v", "k", "t", "m")), self.mode.get(), float(self.vars["seconds"].get()))
+    def read_config(self) -> Config:
+        cfg = Config(*(int(self.values[x].get()) for x in ("v", "k", "t", "m")),
+                     self.mode.get(), float(self.values["seconds"].get()))
+        cfg.validate()
+        return cfg
 
-    def write_analysis(self, text: str) -> None:
-        self.analysis.configure(state="normal"); self.analysis.delete("1.0", "end"); self.analysis.insert("end", text); self.analysis.configure(state="disabled")
+    def report_text(self, cfg: Config) -> str:
+        total = choose(cfg.v, cfg.m)
+        per_ticket = coverage_per_ticket(cfg)
+        return (f"CONFIGURAÇÃO DO FECHAMENTO\n(v, k, t, m) = ({cfg.v}, {cfg.k}, {cfg.t}, {cfg.m})\n"
+                f"Modo do motor: {cfg.mode}\n\nANÁLISE COMBINATÓRIA\n"
+                f"Resultados possíveis de m: C({cfg.v},{cfg.m}) = {fmt(total)}\n"
+                f"Blocos possíveis de k: C({cfg.v},{cfg.k}) = {fmt(choose(cfg.v,cfg.k))}\n"
+                f"Cobertura por bilhete (|B ∩ M| >= t): {fmt(per_ticket)}\n"
+                f"Limite inferior por contagem: {fmt(counting_lower_bound(cfg))}\n\n"
+                "O motor seleciona bilhetes pelo ganho real de cobertura, isto é, pela condição |B ∩ M| >= t.\n")
+
+    def set_analysis(self, text: str) -> None:
+        self.analysis.configure(state="normal")
+        self.analysis.delete("1.0", "end")
+        self.analysis.insert("end", text)
+        self.analysis.configure(state="disabled")
 
     def start(self) -> None:
-        if self.worker and self.worker.is_alive(): return
-        try: self.cfg = self.read_cfg()
-        except Exception as exc: messagebox.showerror("Configuração inválida", str(exc)); return
-        self.stop.clear(); self.result = None; self.bar["value"] = 0
-        cfg = self.cfg
-        self.write_analysis(self.initial_report(cfg))
-        self.worker = threading.Thread(target=self.run, args=(cfg,), daemon=True); self.worker.start()
-
-    def initial_report(self, cfg: Config) -> str:
-        total = choose(cfg.v, cfg.m)
-        return (f"Configuração: ({cfg.v}, {cfg.k}, {cfg.t}, {cfg.m})\nModo: {cfg.mode}\n\n"
-                f"Subconjuntos de m: C({cfg.v},{cfg.m}) = {fmt(total)}\n"
-                f"Blocos possíveis de k: C({cfg.v},{cfg.k}) = {fmt(choose(cfg.v,cfg.k))}\n"
-                f"Cobertura por bloco: C({cfg.k},{cfg.m}) = {fmt(choose(cfg.k,cfg.m))}\n"
-                f"Limite inferior por contagem: {fmt(lower_bound(cfg))}\n\n"
-                "Proteção ativa: nenhuma enumeração completa de combinações perigosas será feita.\n")
-
-    def run(self, cfg: Config) -> None:
+        if self.worker and self.worker.is_alive():
+            return
         try:
-            def report(msg: str, value: float) -> None:
-                self.root.after(0, lambda: (self.status.set(msg), self.bar.configure(value=value)))
-            result = solve(cfg, self.stop, report)
+            self.config = self.read_config()
+        except Exception as exc:
+            messagebox.showerror("Configuração inválida", str(exc))
+            return
+        self.stop_event.clear()
+        self.result = None
+        self.progress_bar["value"] = 0
+        self.set_analysis(self.report_text(self.config))
+        self.worker = threading.Thread(target=self.run_engine, args=(self.config,), daemon=True)
+        self.worker.start()
+
+    def run_engine(self, cfg: Config) -> None:
+        try:
+            def progress(message: str, value: float) -> None:
+                self.root.after(0, lambda: (self.status.set(message), self.progress_bar.configure(value=value)))
+            result = solve(cfg, self.stop_event, progress)
             self.result = result
             self.root.after(0, lambda: self.show_result(result))
         except Exception as exc:
@@ -313,45 +334,82 @@ class App:
 
     def show_result(self, result: Result) -> None:
         self.ticket_text.delete("1.0", "end")
-        for i, block in enumerate(result.blocks, 1): self.ticket_text.insert("end", f"{i}: {','.join(map(str, block))}\n")
-        cfg = self.cfg
-        exact = "exata" if result.exact else "estimada por amostragem"
-        self.write_analysis(self.initial_report(cfg) + f"\nRESULTADO\nMétodo: {result.method}\n"
-                            f"Cobertura: {result.percentage:.2f}% ({exact})\nBilhetes: {len(result.blocks)}\n"
-                            f"Iterações: {result.iterations}\nTempo: {result.elapsed:.2f}s\n"
-                            f"Concluída: {'SIM' if result.complete else 'NÃO'}\n"
-                            f"{'Execução interrompida.' if result.stopped else ''}")
-        self.status.set(f"Melhor solução: {len(result.blocks)} bilhete(s) | cobertura {result.percentage:.2f}%")
-        self.bar["value"] = result.percentage
+        for index, block in enumerate(result.blocks, 1):
+            self.ticket_text.insert("end", f"{index}: {format_block(block)}\n")
+        cfg = self.config
+        analysis = self.report_text(cfg) + (
+            f"\nRESULTADO DO FECHAMENTO\nBilhetes gerados: {len(result.blocks)}\n"
+            f"Garantia verificada: {result.percentage:.4f}%\n"
+            f"Resultados cobertos: {fmt(result.covered)} de {fmt(result.total)}\n"
+            f"Resultados não cobertos: {fmt(result.total - result.covered)}\n"
+            f"Análise: {'EXATA' if result.exact else 'AMOSTRAL'}\n"
+            f"Tempo: {result.elapsed:.2f} s\nIterações: {result.iterations}\n"
+            f"{'Execução interrompida pelo usuário.' if result.stopped else ''}\n"
+        )
+        if result.uncovered_examples:
+            analysis += "Exemplos não cobertos:\n" + "\n".join(format_block(x) for x in result.uncovered_examples[:20])
+        self.set_analysis(analysis)
+        self.progress_bar["value"] = result.percentage
+        self.status.set(f"Melhor fechamento: {len(result.blocks)} bilhete(s) | garantia {result.percentage:.4f}%")
 
-    def stop_run(self) -> None:
-        self.stop.set(); self.status.set("Parando com segurança; exibindo a melhor solução disponível...")
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.status.set("Parando com segurança...")
 
     def clear(self) -> None:
-        self.stop.set(); self.result = None; self.ticket_text.delete("1.0", "end"); self.write_analysis(""); self.bar["value"] = 0; self.status.set("Pronto para nova execução.")
+        self.stop_event.set()
+        self.result = None
+        self.ticket_text.delete("1.0", "end")
+        self.set_analysis("")
+        self.progress_bar["value"] = 0
+        self.status.set("Pronto para nova execução.")
 
-    def validate_pasted(self) -> None:
-        try: cfg = self.read_cfg()
-        except Exception as exc: messagebox.showerror("Configuração inválida", str(exc)); return
-        blocks = parse_tickets(self.ticket_text.get("1.0", "end"), cfg.k)
-        if not blocks: messagebox.showwarning("Validação", f"Nenhum bilhete válido com exatamente {cfg.k} números foi encontrado."); return
-        total = choose(cfg.v, cfg.m)
-        targets, exact = target_samples(cfg, total)
-        covered = coverage_of(blocks, targets)
-        pct = 100 * covered / max(1, len(targets))
-        if exact and covered == len(targets): messagebox.showinfo("🏅 COBERTURA 100%", "Cobertura 100% — selo ouro.")
-        else: messagebox.showinfo("Resultado", f"Cobertura: {pct:.2f}% ({'exata' if exact else 'amostral'}).\nNão cobertos na análise: {len(targets)-covered}.")
+    def validate_games(self) -> None:
+        try:
+            cfg = self.read_config()
+        except Exception as exc:
+            messagebox.showerror("Configuração inválida", str(exc))
+            return
+        blocks, ignored = parse_tickets(self.ticket_text.get("1.0", "end"), cfg.k)
+        if not blocks:
+            messagebox.showwarning("VALIDAR JOGOS", f"Nenhum jogo com exatamente k={cfg.k} números foi encontrado.")
+            return
+        targets, exact = make_targets(cfg)
+        target_masks = [as_mask(target) for target in targets]
+        block_masks = [as_mask(block) for block in blocks]
+        uncovered = [target for target, target_mask in zip(targets, target_masks)
+                     if not any(covers(block_mask, target_mask, cfg.t) for block_mask in block_masks)]
+        covered = len(targets) - len(uncovered)
+        percentage = 100.0 * covered / max(1, len(targets))
+
+        text = self.report_text(cfg) + (
+            f"\nVALIDAÇÃO DOS JOGOS COLADOS\nJogos válidos: {len(blocks)}\n"
+            f"Linhas ignoradas: {ignored}\nGarantia existente: {percentage:.4f}%\n"
+            f"Resultados cobertos: {fmt(covered)} de {fmt(len(targets))}\n"
+            f"Resultados não cobertos: {fmt(len(uncovered))}\n"
+            f"Tipo de verificação: {'EXATA' if exact else 'AMOSTRAL'}\n"
+        )
+        if uncovered:
+            text += "\nExemplos de resultados não cobertos:\n" + "\n".join(format_block(x) for x in uncovered[:30])
+        else:
+            text += "\n🏅 SELO OURO — garantia de 100% na verificação realizada."
+        self.set_analysis(text)
+        self.status.set(f"Validação concluída: {percentage:.4f}% de garantia")
 
     def save(self) -> None:
-        if not self.result: messagebox.showwarning("Salvar", "Ainda não há uma solução para salvar."); return
+        if not self.result:
+            messagebox.showwarning("SALVAR TXT", "Ainda não há fechamento gerado para salvar.")
+            return
         path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=(("Texto", "*.txt"), ("Todos", "*.*")))
-        if not path: return
-        Path(path).write_text(self.ticket_text.get("1.0", "end"), encoding="utf-8")
-        messagebox.showinfo("Salvar", f"Arquivo salvo em:\n{path}")
+        if path:
+            Path(path).write_text(self.ticket_text.get("1.0", "end"), encoding="utf-8")
+            messagebox.showinfo("SALVAR TXT", f"Arquivo salvo em:\n{path}")
 
 
 def main() -> None:
-    root = tk.Tk(); App(root); root.mainloop()
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
