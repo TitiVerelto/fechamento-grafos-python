@@ -1,39 +1,26 @@
-# Fechamento combinatório `(v,k,t,m)`
+# Fechamento combinatório (v,k,t,m)
 
-Aplicação desktop Tkinter sem dependências externas.
+Aplicação Tkinter com dois motores:
 
-## Definição implementada
+- **Explícito**: cria o grafo bipartido de incidência entre todos os resultados `M` de tamanho `m` e blocos `B` de tamanho `k`. Existe aresta quando `|M ∩ B| >= t`. Use em instâncias pequenas/médias.
+- **Implícito**: não materializa todos os vértices/arestas; cria candidatos a partir de resultados amostrados e usa o mesmo critério de incidência. Use em instâncias gigantescas. A garantia é marcada como amostral, nunca como 100% exata.
 
-Para todo resultado `M` com `m` números, o programa procura bilhete `B` com `k` números tal que:
+O Cascade mantém a melhor solução válida da rodada anterior, calcula graus dos resultados, exclui bilhetes sem resultados exclusivos e repete a redução. Para parar, clique PARAR. Com tempo 0, não há parada automática por tempo; o motor para ao atingir o limite inferior ou por PARAR.
 
-```text
-|B ∩ M| >= t
-```
-
-As restrições são `k <= v`, `m <= v`, `m >= t` e `k >= t`.
-
-A cobertura de um bilhete é calculada corretamente por:
+A regra é:
 
 ```text
-sum(C(k,i) * C(v-k,m-i) for i in range(t, min(k,m)+1))
+|bilhete ∩ resultado| >= t
 ```
 
-O limite inferior exibido é o limite por contagem:
+A saída é formatada como:
 
 ```text
-ceil(C(v,m) / cobertura_por_bilhete)
+00001: 01 02 03 04 05
 ```
 
-## Execução
+Execute com:
 
 ```bash
 python main.py
 ```
-
-## Motor
-
-O motor é uma heurística de **set cover**: cria candidatos de `k` números contendo `t` números de resultados ainda não cobertos e escolhe o candidato que cobre a maior quantidade de resultados pela condição real `|B ∩ M| >= t`.
-
-Quando `C(v,m)` cabe no limite seguro, a verificação é exata. Em configurações muito grandes, o programa usa uma amostra limitada e informa `AMOSTRAL`, sem tentar alocar combinações gigantescas e travar o computador.
-
-O botão **VALIDAR JOGOS** lê os jogos colados na área de bilhetes, calcula a porcentagem de garantia, lista resultados não cobertos e exibe o selo ouro quando a verificação exata chega a 100%.
